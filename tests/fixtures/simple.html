@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html>
+<head><title>Simple</title></head>
+<body>
+  <h1>Hello proton-cli</h1>
+  <a href="#next" id="link">Next page</a>
+  <input id="name" type="text" placeholder="Your name" />
+  <button id="btn">Click me</button>
+  <p id="result"></p>
+  <iframe title="Composer frame" srcdoc="&lt;div contenteditable='true' aria-label='Message body'&gt;Draft&lt;/div&gt;"></iframe>
+  <script>
+    document.getElementById('btn').addEventListener('click', function () {
+      var name = document.getElementById('name').value;
+      document.getElementById('result').textContent = 'Hello, ' + (name || 'world');
+    });
+  </script>
+</body>
+</html>

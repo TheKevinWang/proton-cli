@@ -9,6 +9,8 @@ from proton_cli.release_policy import RELEASE_POLICY
 
 BrowserMode = Literal["headed", "headless"]
 MailboxFolder = Literal["inbox", "sent"]
+RecoveryVerificationMode = Literal["proton", "interactive"]
+RecoveryVerificationSelection = Literal["auto", "proton", "interactive"]
 
 
 @dataclass
@@ -65,6 +67,17 @@ class SendCommand:
 
 
 @dataclass
+class RecoveryEmailAddCommand:
+    kind: Literal["recovery-email-add"] = "recovery-email-add"
+    email: str = ""
+    password_env: str | None = None
+    verification: RecoveryVerificationSelection = "auto"
+    recovery_password_env: str | None = None
+    recovery_proxy: str = "socks5://localhost:9150"
+    timeout_seconds: int = 180
+
+
+@dataclass
 class BrowserStatusCommand:
     kind: Literal["browser-status"] = "browser-status"
 
@@ -117,12 +130,21 @@ class CloseOutcome:
     status: Literal["closed", "not_configured"]
 
 
+@dataclass
+class RecoveryEmailOutcome:
+    email: str
+    status: Literal["verified", "already_verified"]
+    verification: RecoveryVerificationMode
+    session: str
+
+
 ParsedCommand = (
     LoginCommand
     | InboxCommand
     | RefreshCommand
     | ReadCommand
     | SendCommand
+    | RecoveryEmailAddCommand
     | BrowserStatusCommand
     | BrowserCloseCommand
     | HelpCommand

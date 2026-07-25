@@ -5,9 +5,15 @@ from __future__ import annotations
 import re
 
 from proton_cli.snapshot import (
+    find_collapsed_message_header_refs,
     find_composer_body_editor_ref,
     find_first_ref,
+    find_mailbox_inbox_ref,
+    find_mark_as_read_ref,
     find_recipient_field_ref,
+    find_recovery_message_checkbox_ref,
+    find_recovery_message_open_ref,
+    find_recovery_message_row_ref,
     find_send_confirmation_ref,
     find_welcome_button_ref,
     is_mailbox_visible,
@@ -98,6 +104,48 @@ def test_account_page_not_mailbox() -> None:
 def test_find_first_ref() -> None:
     assert find_first_ref(INBOX_SNAPSHOT, [re.compile(r'button "Compose"', re.I)]) == "e2"
     assert find_first_ref(INBOX_SNAPSHOT, [re.compile(r'button "Refresh"', re.I)]) == "e3"
+
+
+def test_recovery_message_row_can_require_visible_unread_state() -> None:
+    unread = """
+- region "4 messages in conversation Verify your recovery email" [ref=e10] [cursor=pointer]:
+  - checkbox [ref=e9]
+  - generic [ref=e11]:
+    - generic [ref=e12]: Unread email
+    - generic "no-reply@verify.proton.me" [ref=e13]: Proton
+    - heading "4 messages in conversation Verify your recovery email" [ref=e14]
+"""
+    read = unread.replace("- generic [ref=e12]: Unread email\n", "")
+
+    assert find_recovery_message_row_ref(unread, require_unread=True) == "e10"
+    assert find_recovery_message_row_ref(read, require_unread=True) is None
+    assert find_recovery_message_row_ref(read) == "e10"
+    assert find_recovery_message_checkbox_ref(unread, require_unread=True) == "e9"
+    assert find_recovery_message_checkbox_ref(read, require_unread=True) is None
+    assert find_recovery_message_open_ref(unread, require_unread=True) == "e14"
+    assert find_mark_as_read_ref('- button "Mark as read" [ref=e20]') == "e20"
+
+
+def test_find_mailbox_inbox_ref() -> None:
+    assert (
+        find_mailbox_inbox_ref(
+            '- link "Inbox 3 unread conversations" [ref=e20] [cursor=pointer]'
+        )
+        == "e20"
+    )
+
+
+def test_find_collapsed_message_header_refs() -> None:
+    snapshot = """
+- article [active] [ref=e30]:
+  - generic [ref=e31] [cursor=pointer]
+  - iframe [ref=f1e5]:
+    - link "Verify email" [ref=f1e6]
+- article [ref=e40]:
+  - generic [ref=e41] [cursor=pointer]
+"""
+
+    assert find_collapsed_message_header_refs(snapshot) == ["e41"]
 
 
 def test_find_new_message_button() -> None:

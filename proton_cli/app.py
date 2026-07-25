@@ -57,6 +57,10 @@ from proton_cli.types import (
     ParsedCommand,
     ParsedInvocation,
     ReadMessage,
+    RecoveryEmailAddCommand,
+    RecoveryEmailOutcome,
+    RecoveryVerificationMode,
+    RecoveryVerificationSelection,
     SendCommand,
 )
 from proton_cli.validation import (
@@ -65,12 +69,24 @@ from proton_cli.validation import (
     resolve_login_password,
     resolve_send_inputs,
 )
+from proton_cli.workflows.recovery_email import (
+    InteractiveRecoveryEmailVerifier,
+    ProtonMailboxVerifier,
+    RecoveryEmailVerifier,
+    run_recovery_email_workflow,
+)
 
 LOGIN_URL = "https://account.proton.me/mail"
 INBOX_URL = "https://mail.proton.me/u/0/inbox"
 SENT_URL = "https://mail.proton.me/u/0/all-sent"
 SEND_CONFIRMATION_TIMEOUT_MS = 120_000
 SEND_CLICK_SETTLE_MS = 10_000
+_PROTON_RECOVERY_DOMAINS = {"proton.me", "protonmail.com", "protonmail.ch", "pm.me"}
+
+
+async def _default_interactive_callback(prompt: str) -> None:
+    print(prompt, file=sys.stderr)
+    await asyncio.to_thread(sys.stdin.readline)
 
 
 @dataclass
@@ -86,6 +102,10 @@ class Runtime:
     tcp_probe: Callable[[str, int], Awaitable[bool]] = field(
         default_factory=lambda: _tcp_port_open
     )
+    borrowed_sessions: dict[str, SessionState] = field(default_factory=dict)
+    interactive_callback: Callable[[str], Awaitable[None]] = field(
+        default_factory=lambda: _default_interactive_callback
+    )
 
 
 @dataclass
@@ -97,6 +117,7 @@ class RunCliOptions:
     browser: BrowserFacade | None = None
     sleep: Callable[[float], Any] | None = None
     tcp_probe: Callable[[str, int], Awaitable[bool]] | None = None
+    interactive_callback: Callable[[str], Awaitable[None]] | None = None
 
 
 @dataclass
@@ -123,6 +144,11 @@ async def run_cli(options: RunCliOptions) -> RunCliResult:
         browser=options.browser if options.browser is not None else BrowserFacade(),
         sleep=options.sleep if options.sleep is not None else asyncio.sleep,
         tcp_probe=options.tcp_probe if options.tcp_probe is not None else _tcp_port_open,
+        interactive_callback=(
+            options.interactive_callback
+            if options.interactive_callback is not None
+            else _default_interactive_callback
+        ),
     )
 
     parsed = parse_argv(options.argv)
@@ -134,6 +160,9 @@ async def run_cli(options: RunCliOptions) -> RunCliResult:
 async def _browser_status_core(
     global_options: GlobalOptions, runtime: Runtime
 ) -> SessionState | None:
+    borrowed = runtime.borrowed_sessions.get(global_options.session)
+    if borrowed is not None:
+        return borrowed
     return await runtime.store.load(global_options.session)
 
 
@@ -164,6 +193,10 @@ async def execute(parsed: ParsedInvocation, runtime: Runtime) -> str:
             return await read_message(parsed.global_options, command.handle, runtime)
         if command.kind == "send":
             return await send_message(parsed.global_options, command, runtime)
+        if command.kind == "recovery-email-add":
+            return await recovery_email_command(
+                parsed.global_options, command, runtime
+            )
         raise CliError("Unsupported command.", code="UNSUPPORTED_COMMAND")
 
     if parsed.global_options.trace:
@@ -190,6 +223,13 @@ async def _validate_before_browser(command: ParsedCommand, runtime: Runtime) -> 
         )
     if command.kind == "send":
         await resolve_send_inputs(command, runtime.cwd)
+    if command.kind == "recovery-email-add":
+        _resolve_optional_secret(
+            literal=None,
+            env_name=command.password_env,
+            runtime=runtime,
+            label="source account password",
+        )
 
 
 async def _login_core(
@@ -347,8 +387,8 @@ async def _read_core(
     await _open_inbox_row(global_options, runtime, row)
     await runtime.sleep(1.2)
     snapshot = await _expand_conversation_messages(global_options.session, runtime)
-    # The message body renders in an iframe; the frame-aware snapshot descends
-    # into same-target frames so the standard parser sees the body text directly.
+    # The message body renders in an iframe; the multi-frame snapshot descends
+    # into it, so the standard parser sees the body text directly.
     message = parse_read_message_snapshot(snapshot)
     latest = await runtime.store.load(global_options.session) or state
     await _save_success(runtime, latest)
@@ -530,9 +570,164 @@ async def send_message(global_options: GlobalOptions, command: SendCommand, runt
     )
 
 
+async def _recovery_email_core(
+    global_options: GlobalOptions,
+    *,
+    email: str,
+    account_password: str | None,
+    account_password_env: str | None,
+    verifier: RecoveryEmailVerifier | None,
+    verification: RecoveryVerificationSelection,
+    recovery_password: str | None,
+    recovery_password_env: str | None,
+    recovery_proxy: str,
+    timeout_seconds: int,
+    runtime: Runtime,
+) -> RecoveryEmailOutcome:
+    if not runtime.browser.supports_recovery_email():
+        raise CliError(
+            "Recovery-email automation is unavailable in this browser backend.",
+            code="RECOVERY_EMAIL_UNAVAILABLE",
+        )
+    if "@" not in email or not email.rpartition("@")[2]:
+        raise CliError(
+            "A valid recovery email address is required.",
+            code="INVALID_EMAIL",
+            exit_code=2,
+        )
+    if timeout_seconds <= 0:
+        raise CliError(
+            "timeout_seconds must be positive.",
+            code="INVALID_NUMBER",
+            exit_code=2,
+        )
+    if not recovery_proxy.startswith("socks5://"):
+        raise CliError(
+            "recovery_proxy must be a socks5:// URL.",
+            code="INVALID_PROXY",
+            exit_code=2,
+        )
+
+    source_secret = _resolve_optional_secret(
+        literal=account_password,
+        env_name=account_password_env,
+        runtime=runtime,
+        label="source account password",
+    )
+    selected = _select_recovery_verification(verification, email)
+    selected_verifier = verifier
+    if selected_verifier is None and selected == "proton":
+        recovery_secret = _resolve_optional_secret(
+            literal=recovery_password,
+            env_name=recovery_password_env,
+            runtime=runtime,
+            label="recovery mailbox password",
+        )
+        if recovery_secret is None:
+            raise CliError(
+                "Automatic Proton verification requires recovery mailbox credentials.",
+                code="RECOVERY_MAILBOX_CREDENTIALS_REQUIRED",
+            )
+        selected_verifier = ProtonMailboxVerifier(
+            email=email,
+            password=recovery_secret,
+            proxy=recovery_proxy,
+            timeout_seconds=timeout_seconds,
+        )
+    elif selected_verifier is None:
+        selected_verifier = InteractiveRecoveryEmailVerifier(
+            runtime.interactive_callback
+        )
+
+    await _ensure_session(global_options, runtime)
+    return await run_recovery_email_workflow(
+        runtime.browser,
+        source_session=global_options.session,
+        email=email,
+        account_password=source_secret,
+        verifier=selected_verifier,
+        verification=selected,
+        timeout_seconds=timeout_seconds,
+        sleep=runtime.sleep,
+    )
+
+
+async def recovery_email_command(
+    global_options: GlobalOptions,
+    command: RecoveryEmailAddCommand,
+    runtime: Runtime,
+) -> str:
+    outcome = await _recovery_email_core(
+        global_options,
+        email=command.email,
+        account_password=None,
+        account_password_env=command.password_env,
+        verifier=None,
+        verification=command.verification,
+        recovery_password=None,
+        recovery_password_env=command.recovery_password_env,
+        recovery_proxy=command.recovery_proxy,
+        timeout_seconds=command.timeout_seconds,
+        runtime=runtime,
+    )
+    if global_options.json:
+        return json_output(
+            {
+                "ok": True,
+                "command": "recovery-email add",
+                "outcome": outcome,
+            }
+        )
+    if outcome.status == "already_verified":
+        return f"Recovery email already verified: {outcome.email}"
+    return f"Recovery email verified: {outcome.email}"
+
+
+def _select_recovery_verification(
+    requested: RecoveryVerificationSelection, email: str
+) -> RecoveryVerificationMode:
+    if requested == "proton":
+        return "proton"
+    if requested == "interactive":
+        return "interactive"
+    domain = email.rpartition("@")[2].lower()
+    return "proton" if domain in _PROTON_RECOVERY_DOMAINS else "interactive"
+
+
+def _resolve_optional_secret(
+    *,
+    literal: str | None,
+    env_name: str | None,
+    runtime: Runtime,
+    label: str,
+) -> str | None:
+    if literal is not None and env_name is not None:
+        raise CliError(
+            f"Provide the {label} directly or through an environment variable, not both.",
+            code="CONFLICTING_PASSWORD_SOURCE",
+            exit_code=2,
+        )
+    if literal is not None:
+        return literal
+    if env_name is None:
+        return None
+    value = runtime.env.get(env_name)
+    if value is None or value == "":
+        raise CliError(
+            f"Environment variable {env_name} is not set.",
+            code="MISSING_PASSWORD_ENV",
+            exit_code=2,
+        )
+    return value
+
+
 async def _close_core(
     global_options: GlobalOptions, force: bool, runtime: Runtime
 ) -> CloseOutcome:
+    if global_options.session in runtime.borrowed_sessions:
+        await runtime.browser.release(global_options.session)
+        del runtime.borrowed_sessions[global_options.session]
+        return CloseOutcome(session=global_options.session, status="closed")
     state = await runtime.store.load(global_options.session)
     if state is None:
         return CloseOutcome(session=global_options.session, status="not_configured")
@@ -629,6 +824,9 @@ async def _ensure_session(
     requested_mode: BrowserMode | None = None,
     replace_external_with_managed: bool = False,
 ) -> SessionState:
+    borrowed = runtime.borrowed_sessions.get(global_options.session)
+    if borrowed is not None:
+        return borrowed
     existing = await runtime.store.load(global_options.session)
     out = output_dir(runtime.app_root, global_options.session)
     ensure_private_dir(out)
@@ -728,7 +926,7 @@ async def _refresh_managed_browser_state(
     mode: BrowserMode,
     runtime: Runtime,
 ) -> SessionState:
-    """Refresh PID and endpoint after a managed browser may have been relaunched."""
+    """Refresh the saved endpoint after a managed browser may have relaunched."""
     if not state.managed:
         return state
     info = await runtime.browser.status(session)
@@ -740,7 +938,9 @@ async def _refresh_managed_browser_state(
             **state.__dict__,
             "mode": mode,
             "debug_endpoint": f"http://{host}:{port}" if port else None,
-            "browser_process_id": int(process_id) if isinstance(process_id, int) else None,
+            "browser_process_id": int(process_id)
+            if isinstance(process_id, int)
+            else None,
         }
     )
 
@@ -1145,7 +1345,7 @@ async def _fill_body(session: str, runtime: Runtime, body: str) -> None:
             "Typed message body into Proton search instead of the composer body editor.",
             code="BODY_EDITOR_FOCUS_FAILED",
         )
-    # The editor lives in an iframe; the frame-aware snapshot captures its text,
+    # The editor lives in an iframe; the multi-frame snapshot captures its text,
     # so verify the typed body landed by searching the snapshot directly.
     if body not in updated:
         raise CliError(
@@ -1353,14 +1553,16 @@ def _summarize_snapshot(snapshot: str) -> dict[str, Any]:
 
 
 async def _save_success(runtime: Runtime, state: SessionState) -> None:
-    await runtime.store.save(
-        SessionState(
-            **{
-                **state.__dict__,
-                "last_successful_command_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            }
-        )
+    updated = SessionState(
+        **{
+            **state.__dict__,
+            "last_successful_command_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
     )
+    if state.name in runtime.borrowed_sessions:
+        runtime.borrowed_sessions[state.name] = updated
+        return
+    await runtime.store.save(updated)
 
 
 def _log(runtime: Runtime, message: str) -> None:

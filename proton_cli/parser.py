@@ -16,6 +16,7 @@ from proton_cli.types import (
     ParsedCommand,
     ParsedInvocation,
     ReadCommand,
+    RecoveryEmailAddCommand,
     RefreshCommand,
     SendCommand,
 )
@@ -108,6 +109,8 @@ def _parse_command(args: list[str], global_options: GlobalOptions) -> ParsedComm
         return _parse_read(rest)
     if name == "send":
         return _parse_send(rest)
+    if name == "recovery-email":
+        return _parse_recovery_email(rest)
     if name == "browser":
         return _parse_browser(rest, global_options)
     raise CliError(f"Unknown command: {name}", code="UNKNOWN_COMMAND", exit_code=2)
@@ -331,6 +334,82 @@ def _parse_browser(args: list[str], global_options: GlobalOptions) -> ParsedComm
         code="UNKNOWN_BROWSER_COMMAND",
         exit_code=2,
     )
+
+
+def _parse_recovery_email(args: list[str]) -> RecoveryEmailAddCommand:
+    _reject_mode_flags(args)
+    if not args or args[0] != "add":
+        raise CliError(
+            "recovery-email requires the add subcommand.",
+            code="UNKNOWN_RECOVERY_EMAIL_COMMAND",
+            exit_code=2,
+        )
+    command = RecoveryEmailAddCommand()
+    value_flags = {
+        "--email",
+        "--password-env",
+        "--verification",
+        "--recovery-password-env",
+        "--recovery-proxy",
+        "--timeout-seconds",
+    }
+    index = 1
+    while index < len(args):
+        arg = args[index]
+        with_value = _split_flag_value(arg)
+        if with_value is not None and with_value["name"] in value_flags:
+            name = with_value["name"]
+            value = with_value["value"]
+            index += 1
+        elif arg in value_flags:
+            if index + 1 >= len(args):
+                raise CliError(
+                    f"Missing value for {arg}.",
+                    code="MISSING_FLAG_VALUE",
+                    exit_code=2,
+                )
+            name = arg
+            value = args[index + 1]
+            index += 2
+        else:
+            raise CliError(
+                f"Unknown recovery-email option: {arg}",
+                code="UNKNOWN_OPTION",
+                exit_code=2,
+            )
+
+        if name == "--email":
+            command.email = value
+        elif name == "--password-env":
+            command.password_env = value
+        elif name == "--verification":
+            if value not in {"auto", "proton", "interactive"}:
+                raise CliError(
+                    "--verification must be auto, proton, or interactive.",
+                    code="INVALID_RECOVERY_VERIFICATION",
+                    exit_code=2,
+                )
+            command.verification = value  # type: ignore[assignment]
+        elif name == "--recovery-password-env":
+            command.recovery_password_env = value
+        elif name == "--recovery-proxy":
+            if not value.startswith("socks5://"):
+                raise CliError(
+                    f"--recovery-proxy must be a socks5:// URL, got: {value}",
+                    code="INVALID_PROXY",
+                    exit_code=2,
+                )
+            command.recovery_proxy = value
+        elif name == "--timeout-seconds":
+            command.timeout_seconds = _parse_positive_int(value, name)
+
+    if not command.email.strip():
+        raise CliError(
+            "recovery-email add requires --email <address>.",
+            code="MISSING_EMAIL",
+            exit_code=2,
+        )
+    return command
 
 
 def _parse_limit(args: list[str]) -> int:

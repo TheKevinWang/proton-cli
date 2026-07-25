@@ -15,7 +15,6 @@ temp/
 *.png
 *.jpg
 *.jpeg
-AGENTS.md
 
 # Local browser state can contain authenticated Proton sessions.
 profiles/

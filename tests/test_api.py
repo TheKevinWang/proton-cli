@@ -10,7 +10,8 @@ import pytest
 from proton_cli import CliError, ProtonClient
 from proton_cli.release_policy import RELEASE_POLICY
 from proton_cli.session import SessionState, SessionStore
-from proton_cli.types import InboxRow, ReadMessage
+from proton_cli.types import InboxRow, ReadMessage, RecoveryEmailOutcome
+from proton_cli.workflows.recovery_email import RecoveryEmailChallenge
 
 # Import test helpers that are not fixtures from the shared conftest.
 from tests.conftest import _tcp_always_open
@@ -275,3 +276,93 @@ async def test_api_login_uses_default_proxy_when_not_specified(
     open_calls = browser.calls_of("open_managed")
     assert len(open_calls) == 1
     assert open_calls[0]["proxy"] == RELEASE_POLICY.default_proxy
+
+
+@pytest.mark.asyncio
+async def test_from_zendriver_tab_registers_in_process_without_cdp_or_store(
+    make_browser: MakeBrowser,
+    tmp_path: Path,
+    no_sleep: Sleep,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    browser = make_browser()
+    monkeypatch.setattr("proton_cli.api.BrowserFacade", lambda: browser)
+    tab = object()
+    probe_calls = 0
+
+    async def fail_probe(_host: str, _port: int) -> bool:
+        nonlocal probe_calls
+        probe_calls += 1
+        raise AssertionError("borrowed tabs must not probe TCP")
+
+    client = ProtonClient.from_zendriver_tab(
+        tab,  # type: ignore[arg-type]
+        session="borrowed",
+        app_root=tmp_path,
+    )
+    client._sleep = no_sleep
+    client._tcp_probe = fail_probe
+
+    state = await client.status()
+
+    assert state is not None
+    assert state.name == "borrowed"
+    assert state.managed is False
+    assert len(browser.calls_of("borrow_tab")) == 1
+    assert not browser.calls_of("attach")
+    assert not browser.calls_of("attach_external")
+    assert probe_calls == 0
+    assert not (tmp_path / "sessions" / "borrowed.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_api_add_recovery_email_returns_typed_outcome(
+    make_browser: MakeBrowser, tmp_path: Path, no_sleep: Sleep
+) -> None:
+    await _seed_managed_session(tmp_path)
+    snapshots = [
+        '- button "Toggle settings" [ref=e1]',
+        '- link "All settings" [ref=e2]',
+        '- link "Recovery" [ref=e3]',
+        '- link "Email verification Add an email address" [ref=e4]',
+        (
+            '- textbox "Your recovery email" [ref=e5]:\n'
+            '  - text: recovery@proton.me\n'
+            '- generic [ref=e6]: Unverified\n'
+            '- button "Verify" [ref=e7]'
+        ),
+        '- button "Verify with email" [ref=e8]',
+        (
+            '- textbox "Your recovery email" [ref=e5]:\n'
+            '  - text: recovery@proton.me\n'
+            '- generic [ref=e6]: Unverified\n'
+            '- alert [ref=e9]: Verification email sent to recovery@proton.me'
+        ),
+        (
+            '- textbox "Your recovery email" [ref=e5]:\n'
+            '  - text: recovery@proton.me\n'
+            '- generic [ref=e10]: Verified'
+        ),
+    ]
+    browser = make_browser(snapshots)
+
+    class Verifier:
+        async def __aenter__(self) -> Verifier:
+            return self
+
+        async def complete(self, challenge: RecoveryEmailChallenge) -> None:
+            assert challenge.email == "recovery@proton.me"
+
+        async def __aexit__(self, *_exc: object) -> None:
+            return None
+
+    client = _client(tmp_path, browser, no_sleep)
+    outcome = await client.add_recovery_email(
+        email="recovery@proton.me",
+        verifier=Verifier(),
+        verification="proton",
+        timeout_seconds=10,
+    )
+
+    assert isinstance(outcome, RecoveryEmailOutcome)
+    assert outcome.status == "verified"

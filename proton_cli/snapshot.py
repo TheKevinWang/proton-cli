@@ -18,6 +18,203 @@ def find_first_ref(snapshot: str, patterns: list[re.Pattern[str]]) -> str | None
     return None
 
 
+def find_recovery_control_ref(snapshot: str, control: str) -> str | None:
+    """Find a visible recovery workflow control without reading DOM properties."""
+    patterns: dict[str, list[re.Pattern[str]]] = {
+        "toggle-settings": [re.compile(r'button "Toggle settings"', re.I)],
+        "all-settings": [re.compile(r'link "All settings"', re.I)],
+        "recovery": [re.compile(r'link "Recovery"(?:\s|\[)', re.I)],
+        "email-verification": [
+            re.compile(r'link "Email verification(?:\s|")', re.I)
+        ],
+        "recovery-email": [re.compile(r'textbox "Your recovery email"', re.I)],
+        "add-and-verify": [re.compile(r'button "Add and verify"', re.I)],
+        "password": [re.compile(r'textbox "Password"', re.I)],
+        "authenticate": [re.compile(r'button "Authenticate"', re.I)],
+        "verify": [re.compile(r'button "Verify"', re.I)],
+        "verify-with-email": [re.compile(r'button "Verify with email"', re.I)],
+        "verify-email-link": [re.compile(r'link "Verify email"', re.I)],
+    }
+    return find_first_ref(snapshot, patterns.get(control, []))
+
+
+def recovery_email_state(
+    snapshot: str, requested_email: str
+) -> Literal["empty", "same_verified", "same_unverified", "different", "unknown"]:
+    """Classify the visible recovery-email card around its textbox."""
+    lines = snapshot.splitlines()
+    field_index = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if re.search(r'textbox "Your recovery email"', line, re.I)
+        ),
+        None,
+    )
+    if field_index is None:
+        return "unknown"
+    card_lines = [
+        line
+        for line in lines[field_index : field_index + 24]
+        if "/placeholder:" not in line
+    ]
+    card = "\n".join(card_lines)
+    addresses = re.findall(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", card)
+    visible_email = addresses[0].lower() if addresses else None
+    if visible_email is None:
+        return "empty"
+    if visible_email != requested_email.lower():
+        return "different"
+    if re.search(r":\s*Verified\s*$", card, re.I | re.M):
+        return "same_verified"
+    if re.search(r":\s*Unverified\s*$", card, re.I | re.M):
+        return "same_unverified"
+    return "unknown"
+
+
+def is_recovery_password_dialog_visible(snapshot: str) -> bool:
+    return bool(
+        re.search(r'heading "Enter your password"', snapshot, re.I)
+        and find_recovery_control_ref(snapshot, "password")
+        and find_recovery_control_ref(snapshot, "authenticate")
+    )
+
+
+def is_recovery_email_sent_visible(snapshot: str, email: str) -> bool:
+    return bool(
+        re.search(
+            rf"Verification email sent to\s+{re.escape(email)}",
+            snapshot,
+            re.I,
+        )
+    )
+
+
+def is_recovery_recipient_success_visible(snapshot: str) -> bool:
+    return bool(
+        re.search(r'heading "Email verified"', snapshot, re.I)
+        and re.search(r"Thank you for verifying your email address", snapshot, re.I)
+    )
+
+
+def _find_recovery_message_row(
+    snapshot: str, *, require_unread: bool
+) -> tuple[str, str] | None:
+    lines = snapshot.splitlines()
+    for index, line in enumerate(lines):
+        if not re.search(r"\bregion(?:\s|$)", line):
+            continue
+        ref = _extract_ref(line)
+        if ref is None:
+            continue
+        indent = _indent_of(line)
+        subtree = [line]
+        for candidate in lines[index + 1 :]:
+            if candidate.strip() and _indent_of(candidate) <= indent:
+                break
+            subtree.append(candidate)
+        row = "\n".join(subtree)
+        if "Verify your recovery email" not in row:
+            continue
+        if "no-reply@verify.proton.me" not in row:
+            continue
+        if require_unread and not re.search(r"\bUnread email\b", row, re.I):
+            continue
+        return ref, row
+    return None
+
+
+def find_recovery_message_row_ref(
+    snapshot: str, *, require_unread: bool = False
+) -> str | None:
+    """Find an official recovery row, optionally requiring its visible unread marker."""
+    match = _find_recovery_message_row(snapshot, require_unread=require_unread)
+    return match[0] if match else None
+
+
+def find_recovery_message_checkbox_ref(
+    snapshot: str, *, require_unread: bool = False
+) -> str | None:
+    """Find the selection checkbox within an official recovery conversation row."""
+    match = _find_recovery_message_row(snapshot, require_unread=require_unread)
+    if match is None:
+        return None
+    return find_first_ref(match[1], [re.compile(r"\bcheckbox\b", re.I)])
+
+
+def find_recovery_message_open_ref(
+    snapshot: str, *, require_unread: bool = False
+) -> str | None:
+    """Find the visible subject heading used to open a recovery conversation."""
+    match = _find_recovery_message_row(snapshot, require_unread=require_unread)
+    if match is None:
+        return None
+    return find_first_ref(
+        match[1],
+        [re.compile(r'heading ".*Verify your recovery email"', re.I)],
+    )
+
+
+def find_mark_as_read_ref(snapshot: str) -> str | None:
+    """Find Proton Mail's visible selection-toolbar action."""
+    return find_first_ref(
+        snapshot,
+        [re.compile(r'button "Mark as read"', re.I)],
+    )
+
+
+def find_mailbox_inbox_ref(snapshot: str) -> str | None:
+    """Find the visible Inbox navigation link from an open conversation."""
+    return find_first_ref(
+        snapshot,
+        [re.compile(r'link "Inbox(?:\s|")', re.I)],
+    )
+
+
+def find_latest_recovery_verify_link_ref(snapshot: str) -> str | None:
+    refs = [
+        ref
+        for line in snapshot.splitlines()
+        if re.search(r'link "Verify email"', line, re.I)
+        if (ref := _extract_ref(line)) is not None
+    ]
+    return refs[-1] if refs else None
+
+
+def find_collapsed_message_header_refs(snapshot: str) -> list[str]:
+    """Find clickable headers for collapsed messages in a conversation."""
+    article_pattern = re.compile(
+        r"^(?P<indent>\s*)- article"
+        r"(?P<active> \[active\])?"
+        r"(?: \[ref=[^\]]+\])?:?\s*$"
+    )
+    header_pattern = re.compile(
+        r"^\s*- generic \[ref=(?P<ref>[a-z]?\d*e\d+)\] \[cursor=pointer\]",
+        re.I,
+    )
+    refs: list[str] = []
+    article_indent: int | None = None
+    article_active = False
+    for line in snapshot.splitlines():
+        article_match = article_pattern.match(line)
+        if article_match:
+            article_indent = len(article_match.group("indent"))
+            article_active = bool(article_match.group("active"))
+            continue
+        if article_indent is None:
+            continue
+        if line.strip() and _indent_of(line) <= article_indent:
+            article_indent = None
+            continue
+        if article_active:
+            continue
+        header_match = header_pattern.match(line)
+        if header_match:
+            refs.append(header_match.group("ref"))
+            article_indent = None
+    return refs
+
+
 def find_composer_body_editor_ref(snapshot: str) -> str | None:
     lines = snapshot.splitlines()
     for index, line in enumerate(lines):

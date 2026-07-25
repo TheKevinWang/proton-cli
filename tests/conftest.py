@@ -54,6 +54,32 @@ class FakeBrowser:
         self.calls.append(("attach_external", kwargs.get("endpoint")))
         return "attached"
 
+    async def borrow_tab(self, **kwargs: Any) -> str:
+        self.calls.append(("borrow_tab", dict(kwargs)))
+        return "borrowed"
+
+    @asynccontextmanager
+    async def work_tab(
+        self, *, source_session: str, work_session: str
+    ) -> AsyncIterator[str]:
+        self.calls.append(("work_tab", (source_session, work_session)))
+        yield work_session
+
+    async def release(self, session: str) -> str:
+        self.calls.append(("release", session))
+        return "released"
+
+    def supports_recovery_email(self) -> bool:
+        return True
+
+    async def tab_urls(self, session: str) -> list[str]:
+        self.calls.append(("tab_urls", session))
+        return ["https://mail.proton.me/u/1/inbox"]
+
+    async def select_tab(self, session: str, index: int) -> str:
+        self.calls.append(("select_tab", (session, index)))
+        return "selected"
+
     async def close(self, session: str) -> str:
         self.calls.append(("close", session))
         return "closed"

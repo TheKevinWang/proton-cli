@@ -114,3 +114,64 @@ def test_rejects_non_socks5_proxy() -> None:
     with pytest.raises(CliError) as exc_info:
         parse_argv(["--proxy", "http://127.0.0.1:8080", "login", "--email", "user@example.com", "--password", "secret"])
     assert exc_info.value.code == "INVALID_PROXY"
+
+
+def test_recovery_email_add_parser_contract() -> None:
+    parsed = parse_argv(
+        [
+            "recovery-email",
+            "add",
+            "--email",
+            "recovery@proton.me",
+            "--password-env",
+            "SOURCE_PASSWORD",
+            "--verification",
+            "proton",
+            "--recovery-password-env",
+            "RECOVERY_PASSWORD",
+            "--recovery-proxy",
+            "socks5://localhost:9150",
+            "--timeout-seconds",
+            "45",
+        ]
+    )
+
+    assert parsed.command.kind == "recovery-email-add"
+    assert parsed.command.email == "recovery@proton.me"
+    assert parsed.command.password_env == "SOURCE_PASSWORD"
+    assert parsed.command.verification == "proton"
+    assert parsed.command.recovery_password_env == "RECOVERY_PASSWORD"
+    assert parsed.command.recovery_proxy == "socks5://localhost:9150"
+    assert parsed.command.timeout_seconds == 45
+
+
+@pytest.mark.parametrize(
+    "args, code",
+    [
+        (
+            ["recovery-email", "add", "--email", "x@example.test", "--timeout-seconds", "0"],
+            "INVALID_NUMBER",
+        ),
+        (
+            [
+                "recovery-email",
+                "add",
+                "--email",
+                "x@example.test",
+                "--recovery-proxy",
+                "http://localhost:9150",
+            ],
+            "INVALID_PROXY",
+        ),
+        (
+            ["recovery-email", "add", "--email", "x@example.test", "--password", "secret"],
+            "UNKNOWN_OPTION",
+        ),
+    ],
+)
+def test_recovery_email_parser_rejects_unsafe_or_invalid_options(
+    args: list[str], code: str
+) -> None:
+    with pytest.raises(CliError) as raised:
+        parse_argv(args)
+    assert raised.value.code == code

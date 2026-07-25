@@ -13,10 +13,11 @@ import os
 import re
 import subprocess
 import sys
+from collections.abc import AsyncIterator
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import zendriver as zd
 
@@ -27,6 +28,7 @@ from proton_cli.snapshot import find_first_ref
 
 _NAV_TIMEOUT_SECONDS = 60.0
 _CLICKABLE_ROLES = {"button", "link", "listitem", "menuitem", "region", "tab"}
+_MODIFIER_BITS = {"Alt": 1, "Control": 2, "Meta": 4, "Shift": 8}
 
 
 @dataclass(frozen=True)
@@ -43,6 +45,8 @@ class _SessionHandle:
     process_id: int | None = None
     output_dir: Path = field(default_factory=Path)
     refs: dict[str, _RefTarget] = field(default_factory=dict)
+    ownership: Literal["managed", "external", "borrowed", "work"] = "external"
+    modifiers: int = 0
 
 
 class Browser:
@@ -50,6 +54,82 @@ class Browser:
 
     def __init__(self) -> None:
         self._sessions: dict[str, _SessionHandle] = {}
+
+    def supports_recovery_email(self) -> bool:
+        return True
+
+    async def borrow_tab(
+        self,
+        *,
+        session: str,
+        tab: zd.Tab,
+        output_dir: Path,
+    ) -> str:
+        if session in self._sessions:
+            raise CliError(
+                f"Browser session {session} is already open.",
+                code="BROWSER_ALREADY_OPEN",
+                exit_code=2,
+            )
+        if tab.browser is None:
+            raise CliError(
+                "Cannot borrow a tab without an associated browser.",
+                code="BROWSER_CONNECTION_FAILED",
+                exit_code=2,
+            )
+        self._sessions[session] = _SessionHandle(
+            browser=tab.browser,
+            tab=tab,
+            host="",
+            port=0,
+            output_dir=output_dir,
+            ownership="borrowed",
+        )
+        return f"Browser session {session} borrowed an existing tab."
+
+    @contextlib.asynccontextmanager
+    async def work_tab(
+        self,
+        *,
+        source_session: str,
+        work_session: str,
+    ) -> AsyncIterator[str]:
+        if work_session in self._sessions:
+            raise CliError(
+                f"Browser session {work_session} is already open.",
+                code="BROWSER_ALREADY_OPEN",
+                exit_code=2,
+            )
+        source = self._require_session(source_session)
+        original = source.tab
+        work_tab = await source.browser.get(str(original.url), new_tab=True)
+        self._sessions[work_session] = _SessionHandle(
+            browser=source.browser,
+            tab=work_tab,
+            host=source.host,
+            port=source.port,
+            output_dir=source.output_dir,
+            ownership="work",
+        )
+        try:
+            yield work_session
+        finally:
+            self._sessions.pop(work_session, None)
+            try:
+                await work_tab.close()
+            finally:
+                source.tab = original
+
+    async def release(self, session: str) -> str:
+        handle = self._require_session(session)
+        if handle.ownership != "borrowed":
+            raise CliError(
+                f"Browser session {session} is not borrowed.",
+                code="BROWSER_OWNERSHIP_ERROR",
+                exit_code=2,
+            )
+        del self._sessions[session]
+        return f"Browser session {session} released."
 
     async def open_managed(
         self,
@@ -97,6 +177,7 @@ class Browser:
             port=port,
             process_id=process_id,
             output_dir=output_dir,
+            ownership="managed",
         )
         return f"Browser session {session} started on {host}:{port}"
 
@@ -119,6 +200,7 @@ class Browser:
             port=port,
             process_id=process_id,
             output_dir=output_dir,
+            ownership="managed" if process_id is not None else "external",
         )
         return f"Browser session {session} attached to {host}:{port}"
 
@@ -130,11 +212,36 @@ class Browser:
 
     async def close(self, session: str) -> str:
         handle = self._require_session(session)
+        if handle.ownership == "borrowed":
+            return await self.release(session)
+        if handle.ownership == "work":
+            raise CliError(
+                "Temporary work tabs are closed by their context manager.",
+                code="WORK_TAB_OWNERSHIP_ERROR",
+                exit_code=2,
+            )
         await handle.browser.stop()
         if handle.process_id is not None:
             _kill_process(handle.process_id)
         self._sessions.pop(session, None)
         return f"Browser session {session} closed"
+
+    async def tab_urls(self, session: str) -> list[str]:
+        handle = self._require_session(session)
+        return [str(tab.url) for tab in handle.browser.tabs]
+
+    async def select_tab(self, session: str, index: int) -> str:
+        handle = self._require_session(session)
+        tabs = handle.browser.tabs
+        if index < 0 or index >= len(tabs):
+            raise CliError(
+                f"Browser tab index {index} is out of range.",
+                code="BROWSER_TAB_NOT_FOUND",
+                exit_code=2,
+            )
+        handle.tab = tabs[index]
+        handle.refs = {}
+        return f"Selected tab {index}"
 
     async def status(self, session: str) -> dict[str, Any]:
         handle = self._require_session(session)
@@ -170,15 +277,16 @@ class Browser:
                     zd.cdp.accessibility.get_full_ax_tree(frame_id=frame_id)
                 )
             except Exception:  # noqa: BLE001
-                # Out-of-process frames can belong to a different CDP target.
-                # Keep the usable main-frame snapshot and document the public
-                # backend limitation rather than failing every mailbox action.
+                # Out-of-process frames belong to a different CDP target. Keep
+                # the usable same-target trees rather than failing the page.
                 if index == 0:
                     raise
                 continue
             rendered, frame_refs = _render_ax_tree(nodes, ref_start=next_ref)
             if rendered:
-                snapshots.append(rendered if index == 0 else _nest_frame_snapshot(rendered))
+                snapshots.append(
+                    rendered if index == 0 else _nest_frame_snapshot(rendered)
+                )
             refs.update(frame_refs)
             next_ref += len(frame_refs)
         handle.refs = refs
@@ -186,51 +294,57 @@ class Browser:
 
     async def click(self, session: str, target: str) -> str:
         handle, ref = await self._resolve_target(session, target)
-        remote = await handle.tab.send(
-            zd.cdp.dom.resolve_node(backend_node_id=ref.backend_node_id)
+        try:
+            box = await handle.tab.send(
+                zd.cdp.dom.get_box_model(backend_node_id=ref.backend_node_id)
+            )
+        except Exception as exc:
+            raise CliError(
+                f"Could not locate target {target}.", code="STALE_ELEMENT_REF"
+            ) from exc
+        quad = list(box.content)
+        if len(quad) != 8:
+            raise CliError(
+                f"Could not locate target {target}.", code="ELEMENT_CLICK_FAILED"
+            )
+        x = sum(float(value) for value in quad[0::2]) / 4
+        y = sum(float(value) for value in quad[1::2]) / 4
+        await handle.tab.send(
+            zd.cdp.input_.dispatch_mouse_event("mouseMoved", x=x, y=y)
         )
-        if remote.object_id is None:
-            raise CliError(f"Could not resolve target {target}.", code="STALE_ELEMENT_REF")
-        _, error = await handle.tab.send(
-            zd.cdp.runtime.call_function_on(
-                "function() { this.click(); }",
-                object_id=remote.object_id,
-                await_promise=True,
-                user_gesture=True,
-                return_by_value=True,
+        await handle.tab.send(
+            zd.cdp.input_.dispatch_mouse_event(
+                "mousePressed",
+                x=x,
+                y=y,
+                button=zd.cdp.input_.MouseButton.LEFT,
+                buttons=1,
+                click_count=1,
             )
         )
-        if error is not None:
-            raise CliError(f"Could not click target {target}.", code="ELEMENT_CLICK_FAILED")
+        await handle.tab.send(
+            zd.cdp.input_.dispatch_mouse_event(
+                "mouseReleased",
+                x=x,
+                y=y,
+                button=zd.cdp.input_.MouseButton.LEFT,
+                buttons=0,
+                click_count=1,
+            )
+        )
         return f"Clicked {target}"
 
     async def fill(
         self, session: str, target: str, text: str, submit: bool = False
     ) -> str:
-        handle, ref = await self._resolve_target(session, target)
-        remote = await handle.tab.send(
-            zd.cdp.dom.resolve_node(backend_node_id=ref.backend_node_id)
-        )
-        if remote.object_id is None:
-            raise CliError(f"Could not resolve target {target}.", code="STALE_ELEMENT_REF")
-        _, error = await handle.tab.send(
-            zd.cdp.runtime.call_function_on(
-                """function(value) {
-                    this.focus();
-                    if (this.isContentEditable) this.textContent = value;
-                    else this.value = value;
-                    this.dispatchEvent(new InputEvent('input', {bubbles: true, data: value}));
-                    this.dispatchEvent(new Event('change', {bubbles: true}));
-                }""",
-                object_id=remote.object_id,
-                arguments=[zd.cdp.runtime.CallArgument(value=text)],
-                await_promise=True,
-                user_gesture=True,
-                return_by_value=True,
-            )
-        )
-        if error is not None:
-            raise CliError(f"Could not fill target {target}.", code="ELEMENT_FILL_FAILED")
+        await self.click(session, target)
+        await self.key_down(session, "Control")
+        try:
+            await self.press(session, "a")
+        finally:
+            await self.key_up(session, "Control")
+        await self.press(session, "Backspace")
+        await self.type_text(session, text)
         if submit:
             await self.press(session, "Enter")
         return f"Filled {target}"
@@ -256,32 +370,68 @@ class Browser:
     async def type_text(self, session: str, text: str) -> str:
         handle = self._require_session(session)
         for payload in zd.KeyEvents.from_text(text, zd.KeyPressEvent.CHAR):
+            payload["modifiers"] = handle.modifiers
             await handle.tab.send(zd.cdp.input_.dispatch_key_event(**payload))
         return f"Typed {text!r}"
 
     async def press(self, session: str, key: str) -> str:
         handle = self._require_session(session)
-        special = _special_key(key)
-        events = zd.KeyEvents(special if special is not None else key).to_cdp_events(
+        parts = [part.strip() for part in key.split("+") if part.strip()]
+        chord_modifiers = handle.modifiers
+        chord_key = key
+        if len(parts) > 1:
+            chord_key = parts[-1]
+            for part in parts[:-1]:
+                modifier = _modifier_name(part)
+                if modifier is None:
+                    raise CliError(
+                        f"Unsupported key chord: {key}",
+                        code="INVALID_KEY_CHORD",
+                        exit_code=2,
+                    )
+                chord_modifiers |= _MODIFIER_BITS[modifier]
+        special = _special_key(chord_key)
+        events = zd.KeyEvents(
+            special if special is not None else chord_key.lower()
+        ).to_cdp_events(
             zd.KeyPressEvent.DOWN_AND_UP
         )
         for payload in events:
+            payload["modifiers"] = chord_modifiers
             await handle.tab.send(zd.cdp.input_.dispatch_key_event(**payload))
         return f"Pressed {key!r}"
 
     async def key_down(self, session: str, key: str) -> str:
         handle = self._require_session(session)
+        modifier = _modifier_name(key)
+        if modifier is not None:
+            handle.modifiers |= _MODIFIER_BITS[modifier]
+            key = modifier
         await handle.tab.send(
-            zd.cdp.input_.dispatch_key_event(type_="keyDown", key=key, code=key)
+            zd.cdp.input_.dispatch_key_event(
+                type_="keyDown",
+                key=key,
+                code=_key_code(key),
+                modifiers=handle.modifiers,
+            )
         )
         return f"Key down {key!r}"
 
     async def key_up(self, session: str, key: str) -> str:
         handle = self._require_session(session)
+        modifier = _modifier_name(key)
+        normalized_key = modifier if modifier is not None else key
         await handle.tab.send(
-            zd.cdp.input_.dispatch_key_event(type_="keyUp", key=key, code=key)
+            zd.cdp.input_.dispatch_key_event(
+                type_="keyUp",
+                key=normalized_key,
+                code=_key_code(normalized_key),
+                modifiers=handle.modifiers,
+            )
         )
-        return f"Key up {key!r}"
+        if modifier is not None:
+            handle.modifiers &= ~_MODIFIER_BITS[modifier]
+        return f"Key up {normalized_key!r}"
 
     async def upload(self, session: str, paths: list[str]) -> str:
         handle = self._require_session(session)
@@ -473,6 +623,26 @@ def _special_key(key: str) -> Any:
         "arrowdown": zd.SpecialKeys.ARROW_DOWN,
     }
     return mapping.get(normalized)
+
+
+def _modifier_name(key: str) -> str | None:
+    normalized = key.replace("_", "").replace("-", "").lower()
+    return {
+        "alt": "Alt",
+        "control": "Control",
+        "ctrl": "Control",
+        "meta": "Meta",
+        "command": "Meta",
+        "shift": "Shift",
+    }.get(normalized)
+
+
+def _key_code(key: str) -> str:
+    if key in _MODIFIER_BITS:
+        return f"{key}Left"
+    if len(key) == 1 and key.isalpha():
+        return f"Key{key.upper()}"
+    return key
 
 
 async def _connect_browser(host: str, port: int) -> tuple[zd.Browser, zd.Tab]:

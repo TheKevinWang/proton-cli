@@ -3,7 +3,8 @@
 `proton-cli` is an unofficial typed Python CLI and async library that controls
 Proton Mail through the visible web interface using a real Chrome browser. It
 supports login, inbox and Sent listings, refresh, message reading, sending,
-and browser-session lifecycle operations.
+recovery-email registration and verification, and browser-session lifecycle
+operations.
 
 This project is not affiliated with, endorsed by, or sponsored by Proton AG.
 Proton is a trademark of its respective owner.
@@ -13,15 +14,17 @@ Proton is a trademark of its respective owner.
 This public distribution uses the released `zendriver` package directly. It
 walks Chrome's public CDP frame tree and combines the accessibility tree for
 the root document and same-target descendant frames. This supports ordinary
-iframe-hosted message bodies and composer editors without private Zendriver
-extensions.
+iframe-hosted message bodies, composer editors, and recovery verification
+links without private Zendriver extensions. Recovery workflow clicks and
+typing are sent as Chrome mouse and keyboard input events.
 
 Chrome can isolate some cross-origin or sandboxed frames into separate CDP
 targets. The released backend does not currently merge those out-of-process
 targets, so their content may be absent: message reads can be incomplete and a
-send will fail body verification rather than claim success. The private
-development backend has broader multi-target support. Playwright-compatible
-`--trace` capture is also unavailable here and returns `TRACE_UNAVAILABLE`.
+send or recovery verification will fail visibly rather than claim success.
+The private development backend has broader multi-target support.
+Playwright-compatible `--trace` capture is also unavailable here and returns
+`TRACE_UNAVAILABLE`.
 
 Direct browser traffic is the default. To use a SOCKS5 proxy, pass
 `--proxy socks5://HOST:PORT` as a global option.
@@ -35,6 +38,15 @@ Python 3.10 or newer and Chrome or Chromium are required.
     proton-cli login --email USER@example.com --password-env PROTON_PASSWORD
     proton-cli inbox --limit 10
     proton-cli read 1
+    proton-cli recovery-email add --email RECOVERY@example.com \
+      --password-env PROTON_PASSWORD --verification interactive
+
+For a Proton-hosted recovery mailbox, automatic verification uses a separate
+temporary Chrome profile and requires that mailbox's password:
+
+    proton-cli recovery-email add --email RECOVERY@proton.me \
+      --password-env PROTON_PASSWORD --verification proton \
+      --recovery-password-env RECOVERY_PASSWORD
 
 For local development:
 
@@ -50,6 +62,16 @@ For local development:
     async with ProtonClient(session="default") as proton:
         rows = await proton.inbox(limit=10)
         message = await proton.read(rows[0].handle)
+
+An existing in-process Zendriver tab can be lent to the client without
+reconnecting or transferring ownership:
+
+    client = ProtonClient.from_zendriver_tab(tab)
+    outcome = await client.add_recovery_email(
+        email="recovery@example.com",
+        account_password_env="PROTON_PASSWORD",
+        verification="interactive",
+    )
 
 ## Privacy and safety
 

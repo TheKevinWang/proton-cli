@@ -97,6 +97,7 @@ async def test_login_persists_browser_status_refreshed_after_relaunch(
     )
 
     async def changing_status(session: str) -> dict[str, object]:
+        del session
         return next(statuses)
 
     browser.status = changing_status  # type: ignore[method-assign]

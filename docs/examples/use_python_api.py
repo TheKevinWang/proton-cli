@@ -21,6 +21,15 @@ async def main() -> None:
             if rows:
                 message = await proton.read(rows[0].handle)
                 print(message.body)
+            # Recovery registration is also typed. For a Proton recovery
+            # mailbox, supply the two password environment-variable names:
+            #
+            # outcome = await proton.add_recovery_email(
+            #     email="recovery@proton.me",
+            #     account_password_env="SOURCE_PASSWORD",
+            #     recovery_password_env="RECOVERY_PASSWORD",
+            # )
+            # print(outcome.status)
         except CliError as exc:
             print(f"proton-cli error [{exc.code}]: {exc}")
 

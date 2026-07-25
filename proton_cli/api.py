@@ -14,6 +14,8 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+import zendriver as zd
+
 from proton_cli.app import (
     Runtime,
     _browser_status_core,
@@ -21,12 +23,14 @@ from proton_cli.app import (
     _inbox_core,
     _login_core,
     _read_core,
+    _recovery_email_core,
     _refresh_core,
     _send_core,
     _tcp_port_open,
 )
 from proton_cli.browser import Browser as BrowserFacade
 from proton_cli.paths import default_app_root
+from proton_cli.paths import output_dir as session_output_dir
 from proton_cli.session import SessionState, SessionStore
 from proton_cli.types import (
     BrowserMode,
@@ -38,8 +42,11 @@ from proton_cli.types import (
     LoginOutcome,
     MailboxFolder,
     ReadMessage,
+    RecoveryEmailOutcome,
+    RecoveryVerificationSelection,
     SendCommand,
 )
+from proton_cli.workflows.recovery_email import RecoveryEmailVerifier
 
 
 class ProtonClient:
@@ -75,6 +82,20 @@ class ProtonClient:
         self._sleep = sleep
         self._tcp_probe = tcp_probe
         self._runtime: Runtime | None = None
+        self._borrowed_tab: zd.Tab | None = None
+
+    @classmethod
+    def from_zendriver_tab(
+        cls,
+        tab: zd.Tab,
+        *,
+        session: str = "borrowed",
+        app_root: Path | None = None,
+        verbose: bool = False,
+    ) -> ProtonClient:
+        client = cls(session=session, app_root=app_root, verbose=verbose)
+        client._borrowed_tab = tab
+        return client
 
     async def _get_runtime(self) -> Runtime:
         if self._runtime is None:
@@ -84,7 +105,7 @@ class ProtonClient:
             browser = self._browser_override if self._browser_override is not None else BrowserFacade()
             sleep = self._sleep if self._sleep is not None else asyncio.sleep
             tcp_probe = self._tcp_probe if self._tcp_probe is not None else _tcp_port_open
-            self._runtime = Runtime(
+            runtime = Runtime(
                 cwd=cwd,
                 env=env,
                 app_root=app_root,
@@ -94,6 +115,21 @@ class ProtonClient:
                 sleep=sleep,
                 tcp_probe=tcp_probe,
             )
+            if self._borrowed_tab is not None:
+                out = session_output_dir(app_root, self._session)
+                out.mkdir(parents=True, exist_ok=True)
+                await browser.borrow_tab(
+                    session=self._session,
+                    tab=self._borrowed_tab,
+                    output_dir=out,
+                )
+                runtime.borrowed_sessions[self._session] = SessionState(
+                    name=self._session,
+                    managed=False,
+                    mode="headed",
+                    profile_dir="",
+                )
+            self._runtime = runtime
         return self._runtime
 
     async def __aenter__(self) -> ProtonClient:
@@ -158,6 +194,34 @@ class ProtonClient:
             attachments=list(attachments),
         )
         await _send_core(self._global_options(), command, runtime)
+
+    async def add_recovery_email(
+        self,
+        *,
+        email: str,
+        account_password: str | None = None,
+        account_password_env: str | None = None,
+        verifier: RecoveryEmailVerifier | None = None,
+        verification: RecoveryVerificationSelection = "auto",
+        recovery_password: str | None = None,
+        recovery_password_env: str | None = None,
+        recovery_proxy: str = "socks5://localhost:9150",
+        timeout_seconds: int = 180,
+    ) -> RecoveryEmailOutcome:
+        runtime = await self._get_runtime()
+        return await _recovery_email_core(
+            self._global_options(),
+            email=email,
+            account_password=account_password,
+            account_password_env=account_password_env,
+            verifier=verifier,
+            verification=verification,
+            recovery_password=recovery_password,
+            recovery_password_env=recovery_password_env,
+            recovery_proxy=recovery_proxy,
+            timeout_seconds=timeout_seconds,
+            runtime=runtime,
+        )
 
     async def status(self) -> SessionState | None:
         runtime = await self._get_runtime()
